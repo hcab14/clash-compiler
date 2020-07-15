@@ -20,6 +20,7 @@ import Control.Monad.RWS.Strict (MonadReader, MonadState, RWS)
 import qualified Control.Monad.RWS.Strict as RWS
 import Data.Bifunctor (first, second)
 import Data.IntMap.Strict (IntMap)
+import qualified Data.IntMap.Strict as IntMap
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set.Lens as Set
@@ -28,7 +29,7 @@ import Clash.Core.DataCon
 import Clash.Core.FreeVars (localFVsOfTerms, tyFVsOfTypes, freeLocalIds)
 import Clash.Core.Literal
 import Clash.Core.Name (OccName)
-import Clash.Core.Subst (extendTvSubstList, mkSubst, substTm)
+import Clash.Core.Subst
 import Clash.Core.Term
 import Clash.Core.Termination
 import Clash.Core.TyCon (TyConMap)
@@ -68,7 +69,7 @@ newtype Eval a = Eval { unEval :: RWS LocalEnv () GlobalEnv a }
 --
 runEval :: GlobalEnv -> Eval a -> (a, GlobalEnv)
 runEval genv x =
-  let lenv = LocalEnv mempty mempty
+  let lenv = LocalEnv (genvContext genv) mempty mempty (genvFuel genv)
       (x', genv', _) = RWS.runRWS (unEval x) lenv genv
    in (x', genv')
 
@@ -91,21 +92,39 @@ data Evaluator = Evaluator
 evaluateNf :: Evaluator -> Term -> Eval Nf
 evaluateNf (Evaluator e q) x = e x >>= q
 
+-- TODO Now that Value has VThunk, I would much rather make all arguments
+-- Value instead of TermOrValue. This would also make the primitive evaluator
+-- simpler (as FromAst / ToAst would no longer need fromTerm / toTerm).
+--
 type TermOrValue = Either Term Value
 
 -- | Local Environment
 --
 data LocalEnv = LocalEnv
-  { lenvTypes  :: Map TyVar Type
+  { lenvContext :: Id
+    -- ^ Local context. This is the context in the global environment when
+    -- evaluation reached a head (Lam / TyLam / Data / Prim) so quote can
+    -- "remember" what was being evaluated.
+  , lenvTypes  :: Map TyVar Type
     -- ^ Local type environment. These are types that are introduced while
     -- evaluating the current term (e.g. by type applications).
   , lenvTerms  :: Map Id TermOrValue
     -- ^ Local term environment. These are the terms that are introduced while
     -- evaluating the current term (e.g. by applications).
+  , lenvFuel   :: Word
+    -- ^ Local fuel. This is the amount of fuel left in the global environment
+    -- when evaluation reached a head (Lam / TyLam / Data / Prim) so quote can
+    -- "remember" how much fuel there was at that point in evaluation.
   } deriving (Show)
 
 getLocalEnv :: Eval LocalEnv
-getLocalEnv = RWS.ask
+getLocalEnv = do
+  lenv <- RWS.ask
+  context <- RWS.gets genvContext
+  fuel <- getFuel
+
+  -- Ensure the context and fuel are saved in the local environment.
+  pure (lenv { lenvContext = context, lenvFuel = fuel })
 
 withLocalEnv :: LocalEnv -> Eval a -> Eval a
 withLocalEnv env = RWS.local (const env)
@@ -119,9 +138,14 @@ getLocal i = Map.lookup i <$> RWS.asks lenvTerms
 -- action. The new binding only exists when evaluating the given action.
 --
 withLocal :: (Id, TermOrValue) -> Eval a -> Eval a
-withLocal (i, tm) = RWS.local addBinding
+withLocal (i, tm) act = do
+  iss <- RWS.gets genvInScope
+  env <- RWS.get
+
+  RWS.put (env { genvInScope = extendInScopeSet iss i })
+  RWS.local addBinding act
  where
-  addBinding env@(LocalEnv _ tms) =
+  addBinding env@(LocalEnv _ _ tms _) =
     env { lenvTerms = Map.insert i tm tms }
 
 -- | Remove a local term binding from the environment, then evaluate the given
@@ -130,7 +154,7 @@ withLocal (i, tm) = RWS.local addBinding
 withoutLocal :: Id -> Eval a -> Eval a
 withoutLocal i = RWS.local deleteBinding
  where
-  deleteBinding env@(LocalEnv _ tms) =
+  deleteBinding env@(LocalEnv _ _ tms _) =
     env { lenvTerms = Map.delete i tms }
 
 withLocals :: [(Id, TermOrValue)] -> Eval a -> Eval a
@@ -145,18 +169,37 @@ getType i = Map.lookup i <$> RWS.asks lenvTypes
 -- action. The new binding only exists when evaluating the given action.
 --
 withType :: (TyVar, Type) -> Eval a -> Eval a
-withType (i, ty) = RWS.local addBinding
+withType (i, ty) act = do
+  iss <- RWS.gets genvInScope
+  env <- RWS.get
+
+  RWS.put (env { genvInScope = extendInScopeSet iss i })
+  RWS.local addBinding act
  where
-  addBinding env@(LocalEnv tys _) =
+  addBinding env@(LocalEnv _ tys _ _) =
     env { lenvTypes = Map.insert i ty tys }
 
 withTypes :: [(TyVar, Type)] -> Eval a -> Eval a
 withTypes bs x = foldr withType x bs
 
+getTySubst :: Eval Subst
+getTySubst = do
+  tys <- RWS.asks lenvTypes
+  iss <- RWS.gets genvInScope
+
+  pure $ mkTvSubst iss (mkVarEnv $ Map.toList tys)
+
 -- | Global Environment
 --
 data GlobalEnv = GlobalEnv
-  { genvGlobals :: VarEnv (Binding TermOrValue)
+  { genvContext :: Id
+    -- ^ The identifier of the binding currently under evaluation. This is
+    -- used to prevent inlining self-recursive calls (which is never
+    -- productive) without preventing inlining auxiliary recursive calls.
+    --
+    -- TODO When Clash supports mutually recursive bindings, this will need
+    -- to be changed to a VarSet or something similar.
+  , genvGlobals :: VarEnv (Binding TermOrValue)
     -- ^ Global term environment. These are functions in global scope which
     -- are evaluated on lookup, and updated after evaluation.
   , genvRecInfo :: RecInfo
@@ -181,10 +224,11 @@ data GlobalEnv = GlobalEnv
 -- global environment. This allows IO actions to be evaluated at compile time
 -- where possible.
 --
-type GlobalIO = (IntMap Value, Int)
+type GlobalIO = (IntMap Term, Int)
 
 mkGlobalEnv
-  :: BindingMap
+  :: Id
+  -> BindingMap
   -> RecInfo
   -> Word
   -> GlobalIO
@@ -192,11 +236,33 @@ mkGlobalEnv
   -> InScopeSet
   -> Supply
   -> GlobalEnv
-mkGlobalEnv bs =
-  GlobalEnv (fmap Left <$> bs)
+mkGlobalEnv i bs =
+  GlobalEnv i (fmap Left <$> bs)
 
+putContext :: Id -> Eval ()
+putContext i = do
+  env <- RWS.get
+  RWS.put (env { genvContext = i })
+
+preserveContext :: Eval a -> Eval a
+preserveContext x = do
+  context <- RWS.gets genvContext
+  res <- x
+  env <- RWS.get
+
+  RWS.put (env { genvContext = context })
+  pure res
+
+-- | Get a global from the environment. This will return Nothing if the global
+-- refers to the current context. See genvContext in GlobalEnv.
+--
 getGlobal :: Id -> Eval (Maybe (Binding TermOrValue))
-getGlobal i = lookupVarEnv i <$> RWS.gets genvGlobals
+getGlobal i = do
+  context <- RWS.gets genvContext
+
+  if context == i
+    then pure Nothing
+    else lookupVarEnv i <$> RWS.gets genvGlobals
 
 -- | Update a global binding, replacing it with a WHNF representation.
 --
@@ -213,11 +279,40 @@ updateGlobal i x =
     Nothing ->
       pure ()
 
+getPrimsIO :: Int -> Eval Term
+getPrimsIO i = do
+  heap <- RWS.gets (fst . genvPrimsIO)
+
+  case IntMap.lookup i heap of
+    Just res -> pure res
+    Nothing  -> error ("getPrimsIO: Nothing at address " <> show i)
+
+insertPrimsIO :: Term -> Eval Int
+insertPrimsIO x = do
+  env <- RWS.get
+  let (heap, addr) = genvPrimsIO env
+  let heap' = IntMap.insert addr x heap
+
+  RWS.put (env { genvPrimsIO = (heap', addr + 1) })
+  pure addr
+
+updatePrimsIO :: Int -> Term -> Eval ()
+updatePrimsIO i x = do
+  env <- RWS.get
+  let (heap, addr) = genvPrimsIO env
+
+  if i < addr
+    then do
+      let heap' = IntMap.update (const (Just x)) i heap
+      RWS.put (env { genvPrimsIO = (heap', addr) })
+
+    else error ("updatePrimsIO: Nothing at address " <> show i)
+
 getRecInfo :: Eval RecInfo
 getRecInfo = RWS.gets genvRecInfo
 
 getFuel :: Eval Word
-getFuel = RWS.gets genvFuel
+getFuel = min <$> RWS.asks lenvFuel <*> RWS.gets genvFuel
 
 putFuel :: Word -> Eval ()
 putFuel x = RWS.modify' (\env -> env { genvFuel = x })
@@ -228,7 +323,7 @@ putFuel x = RWS.modify' (\env -> env { genvFuel = x })
 --
 preserveFuel :: Eval a -> Eval a
 preserveFuel x = do
-  fuel <- RWS.gets genvFuel
+  fuel <- getFuel
   res  <- x
   env  <- RWS.get
 
@@ -237,6 +332,9 @@ preserveFuel x = do
 
 getTyConMap :: Eval TyConMap
 getTyConMap = RWS.gets genvTyCons
+
+getInScope :: Eval InScopeSet
+getInScope = RWS.gets genvInScope
 
 mkUniqueVar
   :: ((Supply, InScopeSet)
@@ -260,13 +358,13 @@ mkUniqueId = mkUniqueVar mkUniqSystemId
 mkUniqueTyVar :: OccName -> Kind -> Eval TyVar
 mkUniqueTyVar = mkUniqueVar mkUniqSystemTyVar
 
--- | The result of evaluating the pattern in a case expression. This identifies
--- whether the pattern matched, and contains any identifiers that the pattern
+-- | The result of evaluating the pattern in a case expression. If matching,
+-- this provides the RHS of the alt, and any type or term bindings the pattern
 -- brings into scope.
 --
 data PatResult
   = NoMatch
-  | Match ![(TyVar, Type)] ![(Id, Term)]
+  | Match ![(TyVar, Type)] ![(Id, Term)] !Term
 
 -- | Neutral terms cannot be reduced, as they represent things like variables
 -- which are unknown, partially applied functions, or case expressions where
@@ -322,6 +420,9 @@ data Value
   | VTick   !Value !TickInfo
   | VThunk  !Term !LocalEnv
   deriving (Show)
+
+stripValueTicks :: Value -> Value
+stripValueTicks = fst . collectValueTicks
 
 collectValueTicks :: Value -> (Value, [TickInfo])
 collectValueTicks = go []

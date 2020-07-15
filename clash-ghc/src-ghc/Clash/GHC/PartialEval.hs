@@ -17,6 +17,7 @@ module Clash.GHC.PartialEval
 import Data.Bifunctor
 import Data.Bitraversable
 import Data.Either (partitionEithers)
+import qualified Data.HashMap.Strict as HashMap
 import GHC.Integer.GMP.Internals (BigNat(..), Integer(..))
 import Unsafe.Coerce
 
@@ -31,6 +32,29 @@ import Clash.Core.Type
 import Clash.Core.Var
 import Clash.Unique
 
+import Clash.GHC.PartialEval.Bit
+import Clash.GHC.PartialEval.BitVector
+import Clash.GHC.PartialEval.ByteArray
+import Clash.GHC.PartialEval.Char
+import Clash.GHC.PartialEval.Double
+import Clash.GHC.PartialEval.Enum
+import Clash.GHC.PartialEval.Float
+import Clash.GHC.PartialEval.GhcMisc
+import Clash.GHC.PartialEval.Index
+import Clash.GHC.PartialEval.Int
+import Clash.GHC.PartialEval.Integer
+import Clash.GHC.PartialEval.Internal
+import Clash.GHC.PartialEval.Narrowing
+import Clash.GHC.PartialEval.Natural
+import Clash.GHC.PartialEval.Promoted
+import Clash.GHC.PartialEval.Signed
+import Clash.GHC.PartialEval.Transformations
+import Clash.GHC.PartialEval.Unsigned
+import Clash.GHC.PartialEval.Vector
+import Clash.GHC.PartialEval.Word
+
+import Clash.Debug -- TODO
+
 -- | An evaluator for partial evaluation that uses GHC specific details. This
 -- allows the evaluator to be implemented with an understanding of built-in
 -- GHC types and primitives which can appear in Clash core when using GHC as a
@@ -39,17 +63,60 @@ import Clash.Unique
 ghcEvaluator :: Evaluator
 ghcEvaluator = evaluatorWith ghcMatchLiteral ghcMatchData ghcEvaluatePrim
 
--- TODO Implement evaluation for primitives and call here.
---
+-- | Evaluate a primitive using the specified primitive implementations.
 -- If a primitive can't be reduced, we do the next best thing and force all
 -- it's arguments to WHNF. This is done to simplify the definition of the
 -- NePrim constructor in Neutral.
 --
 ghcEvaluatePrim :: PrimInfo -> [Either Term Type] -> Eval Value
-ghcEvaluatePrim p args =
-  VNeu . NePrim p <$> forceArgs args
+ghcEvaluatePrim p args = do
+  traceM (show (primName p))
+
+  case HashMap.lookup (primName p) primImpls of
+    Just f -> do
+      res <- runPrimEval (f ghcEvaluator p args) neuPrim
+      traceM (show (primName p) <> ": result " <> show res)
+      pure res
+
+    -- TODO This should ideally warn that a primitive has no implementation.
+    Nothing ->
+      case primCoreId p of
+        Just c  -> do
+          traceM (show (primName p) <> ": falling back to core")
+          evaluateWhnf ghcEvaluator (mkApps (Var c) args)
+
+        Nothing -> do
+          traceM (show (primName p) <> ": no implementation")
+          neuPrim
  where
-  forceArgs = traverse (bitraverse (evaluateWhnf ghcEvaluator) pure)
+  neuPrim = do
+    evalArgs <- traverse (bitraverse (evaluateWhnf ghcEvaluator) pure) args
+    let res = VNeu (NePrim p evalArgs)
+
+    -- traceM (show (primName p) <> ": failed, returning " <> show res)
+    pure res
+
+  primImpls = HashMap.unions
+    [ bitPrims
+    , bitVectorPrims
+    , byteArrayPrims
+    , charPrims
+    , doublePrims
+    , enumPrims
+    , floatPrims
+    , ghcPrims
+    , indexPrims
+    , intPrims
+    , integerPrims
+    , narrowingPrims
+    , naturalPrims
+    , promotedPrims
+    , signedPrims
+    , transformationsPrims
+    , unsignedPrims
+    , vectorPrims
+    , wordPrims
+    ]
 
 -- | Attempt to match a literal against a pattern. If the pattern matches
 -- the literal, any identifiers bound in the pattern are added to the
@@ -59,64 +126,66 @@ ghcEvaluatePrim p args =
 -- expressions by using literal patterns or data patterns (from modules like
 -- GHC.Integer.GMP.Internals and GHC.Natural).
 --
-ghcMatchLiteral :: Literal -> Pat -> Eval PatResult
-ghcMatchLiteral l = \case
-  DataPat c [] [i]
+ghcMatchLiteral :: TyConMap -> Literal -> Alt -> PatResult
+ghcMatchLiteral tcm l = \case
+  (DataPat c [] [i], term)
     |  IntegerLiteral n <- l
     -> case n of
          S# _
-           | dcTag c == 1 -> insertInt i n
+           | dcTag c == 1 -> insertInt i n term
 
          Jp# bn
-           | dcTag c == 2 -> insertBigNat i bn
+           | dcTag c == 2 -> insertBigNat i bn term
 
          Jn# bn
-           | dcTag c == 3 -> insertBigNat i bn
+           | dcTag c == 3 -> insertBigNat i bn term
 
-         _ -> pure NoMatch
+         _ -> NoMatch
 
     |  NaturalLiteral n <- l
     -> case n of
          S# _
-           | dcTag c == 1 && n >= 0 -> insertInt i n
+           | dcTag c == 1 && n >= 0 -> insertWord i n term
 
          Jp# bn
-           | dcTag c == 2 -> insertBigNat i bn
+           | dcTag c == 2 -> insertBigNat i bn term
 
-         _ -> pure NoMatch
+         _ -> NoMatch
 
     |  otherwise
-    -> pure NoMatch
+    -> NoMatch
 
-  LitPat m
+  (LitPat m, term)
     |  l == m
-    -> pure (Match [] [])
+    -> Match [] [] term
 
-  DefaultPat
-    -> pure (Match [] [])
+  (DefaultPat, term)
+    -> Match [] [] term
 
-  _ -> pure NoMatch
+  _ -> NoMatch
  where
-  insertInt :: Id -> Integer -> Eval PatResult
-  insertInt i n = pure (Match [] [(i, Literal (IntLiteral n))])
+  insertInt :: Id -> Integer -> Term -> PatResult
+  insertInt i n = Match [] [(i, Literal (IntLiteral n))]
 
-  insertBigNat :: Id -> BigNat -> Eval PatResult
-  insertBigNat i bn = do
-    tcm <- getTyConMap
+  insertWord :: Id -> Integer -> Term -> PatResult
+  insertWord i n = Match [] [(i, Literal (WordLiteral n))]
 
-    -- Add the mapping i |-> VData "BigNat" [byteArray] to the environment.
-    let Just integerTcName = fmap fst (splitTyConAppM integerPrimTy)
-        [_, jpDc, _] = tyConDataCons (lookupUniqMap' tcm integerTcName)
-        ([bnTy], _) = splitFunTys tcm (dcType jpDc)
-        Just bnTcName = fmap fst (splitTyConAppM bnTy)
-        [bnDc] = tyConDataCons (lookupUniqMap' tcm bnTcName)
+  insertBigNat :: Id -> BigNat -> Term -> PatResult
+  insertBigNat i bn =
+    Match [] [(i, val)]
+   where
+    -- Inspect the type of Jp# to get the DataCon for BigNat.
+    -- Somewhat of a hack but I can't think of a better way - Alex.
+    Just integerTcName = fmap fst (splitTyConAppM integerPrimTy)
+    [_, jpDc, _] = tyConDataCons (lookupUniqMap' tcm integerTcName)
+    ([bnTy], _) = splitFunTys tcm (dcType jpDc)
+    Just bnTcName = fmap fst (splitTyConAppM bnTy)
+    [bnDc] = tyConDataCons (lookupUniqMap' tcm bnTcName)
 
-        -- unsafeCoerce should be safe: BigNat and ByteArray are both newtype
-        -- wrappers around ByteArray#.
-        ba = Literal (ByteArrayLiteral (unsafeCoerce bn))
-        val = Data bnDc `App` ba
-
-     in pure (Match [] [(i, val)])
+    -- unsafeCoerce should be safe: BigNat and ByteArray are both newtype
+    -- wrappers around ByteArray#.
+    ba = Literal (ByteArrayLiteral (unsafeCoerce bn))
+    val = Data bnDc `App` ba
 
 -- | Determine whether a given pattern is matched by a data constructor. If
 -- the match is successful, add any bound identifiers from the pattern to
@@ -124,15 +193,15 @@ ghcMatchLiteral l = \case
 --
 -- See evaluateCaseWith in Clash.Core.Evaluator.Semantics for more information.
 --
-ghcMatchData :: DataCon -> [Either Term Type] -> Pat -> Eval PatResult
+ghcMatchData :: DataCon -> [Either Term Type] -> Alt -> PatResult
 ghcMatchData dc args = \case
-  DataPat c tvs ids
+  (DataPat c tvs ids, term)
     |  dc == c
     ,  (tms, tys) <- bimap (zip ids) (zip tvs) (partitionEithers args)
-    -> pure (Match tys tms)
+    -> Match tys tms term
 
-  DefaultPat
-    -> pure (Match [] [])
+  (DefaultPat, term)
+    -> Match [] [] term
 
-  _ -> pure NoMatch
+  _ -> NoMatch
 

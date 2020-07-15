@@ -86,9 +86,7 @@ constantPropagation =
       [ ("applicationPropagation", appPropFast          )
       , ("bindConstantVar"       , bindConstantVar      )
       , ("caseLet"               , caseLet              )
-#if !EXPERIMENTAL_EVALUATOR
       , ("caseCase"              , caseCase             )
-#endif
       , ("caseCon"               , caseCon              )
       , ("elemExistentials"      , elemExistentials     )
       , ("caseElemNonReachable"  , caseElemNonReachable )

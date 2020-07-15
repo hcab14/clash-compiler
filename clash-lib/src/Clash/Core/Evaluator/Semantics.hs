@@ -17,6 +17,7 @@ module Clash.Core.Evaluator.Semantics where
 import Control.Monad ((>=>), foldM)
 import Data.Bifunctor (bimap, first)
 import Data.Bitraversable (bitraverse)
+import Data.Either (lefts, rights)
 import Data.List.Extra (equalLength)
 
 -- TODO: This is GHC specific, but is already used in BindingMap.
@@ -25,11 +26,13 @@ import BasicTypes (InlineSpec(..))
 import Clash.Core.DataCon
 import Clash.Core.Evaluator.Models
 import Clash.Core.Literal
+import Clash.Core.Subst
 import Clash.Core.Term
 import Clash.Core.Termination
 import Clash.Core.TermInfo
 import Clash.Core.TyCon
 import Clash.Core.Type
+import Clash.Core.Util (undefinedTm)
 import Clash.Core.Var
 import Clash.Driver.Types (Binding(..))
 
@@ -41,8 +44,8 @@ import Clash.Driver.Types (Binding(..))
 --   * evalPrim, which evaluates primitive operations
 --
 evaluatorWith
-  :: (Literal -> Pat -> Eval PatResult)
-  -> (DataCon -> [Either Term Type] -> Pat -> Eval PatResult)
+  :: (TyConMap -> Literal -> Alt -> PatResult)
+  -> (DataCon -> [Either Term Type] -> Alt -> PatResult)
   -> (PrimInfo -> [Either Term Type] -> Eval Value)
   -> Evaluator
 evaluatorWith matchLit matchData evalPrim =
@@ -54,8 +57,8 @@ evaluatorWith matchLit matchData evalPrim =
 -- given functions. See 'evaluatorWith' for more information.
 --
 evaluateWith
-  :: (Literal -> Pat -> Eval PatResult)
-  -> (DataCon -> [Either Term Type] -> Pat -> Eval PatResult)
+  :: (TyConMap -> Literal -> Alt -> PatResult)
+  -> (DataCon -> [Either Term Type] -> Alt -> PatResult)
   -> (PrimInfo -> [Either Term Type] -> Eval Value)
   -> Term
   -> Eval Value
@@ -165,17 +168,16 @@ evaluateVarWith eval i
  where
   goLocal :: Eval Value
   goLocal = getLocal i >>= \case
-    Just x  -> forceLocal x
+    Just x  -> either (withoutLocal i . eval) pure x
     Nothing -> pure (VNeu (NeVar i))
-   where
-    forceLocal = either (withoutLocal i . eval) pure
 
   goGlobal :: Eval Value
   goGlobal = do
+    gInScope <- getInScope
     gRecInfo <- getRecInfo
     gFuel <- getFuel
 
-    getGlobal i >>= \case
+    preserveContext $ getGlobal i >>= \case
       Just b
         -- The binding can't be inlined.
         |  bindingSpec b == NoInline
@@ -186,21 +188,22 @@ evaluateVarWith eval i
         -> if gFuel == 0
              then pure (VNeu (NeVar i))
              else do
-               v <- forceGlobal (bindingTerm b)
+               putContext i
                putFuel (gFuel - 1)
+
+               v <- either (eval . deShadowTerm gInScope) pure (bindingTerm b)
                updateGlobal i v
                pure v
 
         -- The binding can be inlined without using fuel.
         |  otherwise
-        -> do v <- forceGlobal (bindingTerm b)
+        -> do putContext i
+              v <- either (eval . deShadowTerm gInScope) pure (bindingTerm b)
               updateGlobal i v
               pure v
 
       Nothing
         -> pure (VNeu (NeVar i))
-   where
-    forceGlobal = either eval pure
 
 -- | Default implementation for evaluating a literal.
 -- This simply wraps the literal up into a Value.
@@ -269,7 +272,11 @@ evaluateAppWith eval evalPrim apply x y
   , nArgs  <- length . fst $ splitFunForallTy (primType p)
   = case compare (length args) nArgs of
       LT -> etaExpand term >>= eval
-      EQ -> evalPrim p args
+      EQ ->
+        let tyVars = lefts . fst $ splitFunForallTy (primType p)
+            tyArgs = rights args
+         in withTypes (zip tyVars tyArgs) (evalPrim p args)
+
       GT -> do
         let (pArgs, rArgs) = splitAt nArgs args
         primRes <- evalPrim p pArgs
@@ -329,13 +336,10 @@ evaluateLetrecWith eval bs x =
 -- to check if a literal is matched would have to check both literal patterns
 -- and data patterns for the constructors of Integer.
 --
--- TODO: Handle undefined scrutinees in case expressions. These should result
--- in the entire expression being replaced with undefined.
---
 evaluateCaseWith
   :: (Term -> Eval Value)
-  -> (Literal -> Pat -> Eval PatResult)
-  -> (DataCon -> [Either Term Type] -> Pat -> Eval PatResult)
+  -> (TyConMap -> Literal -> Alt -> PatResult)
+  -> (DataCon -> [Either Term Type] -> Alt -> PatResult)
   -> Term
   -> Type
   -> [Alt]
@@ -344,32 +348,87 @@ evaluateCaseWith eval matchLit matchData x ty alts
   | [(DefaultPat, y)] <- alts
   = eval y
 
+  -- TODO The result of this should probably remain a case expression.
+  -- If we don't do this then we maybe run the risk of introducing free vars.
   | otherwise
-  = do
-      -- TODO: Restore ticks for scrutinee?
-      evalX <- fst . collectValueTicks <$> eval x
+  = do evalX <- eval x
+       case stripValueTicks evalX of
+         VLit l -> do
+           tcm <- getTyConMap
+           case findBestAlt (matchLit tcm l) alts of
+             NoMatch ->
+               error ("No pattern matched " <> show l <> " in " <> show alts)
 
-      case evalX of
-        VLit l -> evalMatchingAlt (matchLit l) alts
-        VData dc args _env -> evalMatchingAlt (matchData dc args) alts
+             Match tvs ids term ->
+               withTypes tvs $ withLocals (fmap Left <$> ids) (eval term)
 
-        v -> do
-          evalAlts <- traverse (traverse eval) alts
-          pure (VNeu (NeCase v ty evalAlts))
+         VData dc args _env ->
+           case findBestAlt (matchData dc args) alts of
+             NoMatch ->
+               error ("No pattern matched " <> show dc <> " in " <> show alts)
+
+             Match tvs ids term ->
+               withTypes tvs $ withLocals (fmap Left <$> ids) (eval term)
+
+         VNeu (NePrim p args)
+           | primName p == "Clash.Transformations.undefined" ->
+               eval (undefinedTm ty)
+
+           | otherwise ->
+               case findBestAlt (matchClashLit p args) alts of
+                 NoMatch -> do
+                   evalAlts <- traverse (traverse eval) alts
+                   pure (VNeu (NeCase evalX ty evalAlts))
+
+                 Match tys ids term ->
+                   withTypes tys $ withLocals (fmap Left <$> ids) (eval term)
+
+         _ -> do
+           evalAlts <- traverse (traverse eval) alts
+           pure (VNeu (NeCase evalX ty evalAlts))
  where
-  evalMatchingAlt p =
-    -- If the scrutinee is a non-neutral value, and there are no matching
-    -- patterns, the case expression must not cover all patterns.
-    go (error "findMatchingAlt: No matching pattern in case expression")
-   where
-    go best []     = eval best
-    go best (a:as) =
-      p (fst a) >>= \case
-        NoMatch -> go best as
+  -- Some types in clash-prelude can be interpreted as numbers, and matched
+  -- against literal patterns. However, these are in the AST as neutral
+  -- primitives, so we need this function to identify them.
+  --
+  -- TODO: Add DataPat ?
+  --
+  matchClashLit p args (LitPat n, term)
+    | primName p == "Clash.Sized.Internal.BitVector.fromInteger##"
+    , [VLit (WordLiteral 0), VLit l] <- lefts args
+    , n == l
+    = Match [] [] term
 
-        Match tys ids
-          | fst a == DefaultPat -> go (snd a) as
-          | otherwise -> withTypes tys $ withLocals (fmap Left <$> ids) (eval (snd a))
+    | primName p == "Clash.Sized.Internal.BitVector.fromInteger#"
+    , [_kn, VLit (NaturalLiteral 0), VLit l] <- lefts args
+    , n == l
+    = Match [] [] term
+
+    | primName p `elem`
+        [ "Clash.Sized.Internal.Index.fromInteger#"
+        , "Clash.Sized.Internal.Signed.fromInteger#"
+        , "Clash.Sized.Internal.Unsigned.fromInteger#"
+        ]
+    , [_kn, VLit l] <- lefts args
+    , n == l
+    = Match [] [] term
+
+    | otherwise
+    = NoMatch
+
+  matchClashLit _ _ _ = NoMatch
+
+  findBestAlt p =
+    go NoMatch
+   where
+    go :: PatResult -> [Alt] -> PatResult
+    go best [] = best
+    go best (a:as) =
+      case p a of
+        NoMatch -> go best as
+        match
+          | fst a == DefaultPat -> go match as
+          | otherwise -> match
 
 -- | Default implementation for evaluating a cast expression. This simply
 -- evalautes the expression under the cast, keeping the original cast in place.
